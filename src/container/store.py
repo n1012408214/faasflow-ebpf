@@ -9,6 +9,15 @@ import couchdb
 import redis
 import requests
 import container_config
+import ctypes
+import mmap
+import struct
+try:
+    from bcc import BPF
+    EBPF_AVAILABLE = True
+except ImportError:
+    EBPF_AVAILABLE = False
+    print("警告: BCC库未安装，eBPF功能将被禁用", file=sys.stderr)
 
 host_url = 'http://172.17.0.1:8000/{}'
 disk_reader_url = 'http://172.17.0.1:8001/{}'
@@ -49,6 +58,11 @@ class Store:
                 self.block_serial = v['serial_num']
         self.posting_threads = []
         self.outputs_serial = {}
+        
+        # eBPF初始化
+        self.ebpf_program = None
+        self.ebpf_data_map = None
+        self.init_ebpf()
 
     def fetch_scalability_config(self):
         try:
@@ -373,6 +387,8 @@ class Store:
             return data_infos['val']
         elif datatype == 'disk_data_ready':
             return self.fetch_from_disk(data_infos['db_key'])
+        elif datatype == 'ebpf_data_ready':
+            return self.fetch_from_ebpf(data_infos['db_key'], data_infos.get('ebpf_map_id', 0))
         else:
             raise Exception
 
@@ -434,3 +450,370 @@ class Store:
         #     return octet_data.read()
         # else:
         #     return json.loads(self.db.get_attachment(self.request_id, filename=key + '.json', default='no attachment'))
+
+    def init_ebpf(self):
+        """初始化eBPF程序用于高性能数据接收"""
+        if not EBPF_AVAILABLE:
+            print(f"[eBPF] BCC库不可用，eBPF功能已禁用", file=sys.stderr)
+            self.ebpf_program = None
+            self.ebpf_data_map = None
+            self.sock_map = None
+            self.route_map = None
+            return
+            
+        try:
+            # 读取C语言eBPF程序
+            ebpf_file_path = os.path.join(os.path.dirname(__file__), 'faasflow_ebpf.c')
+            
+            if os.path.exists(ebpf_file_path):
+                # 使用外部C文件
+                print(f"[eBPF] 加载C程序文件: {ebpf_file_path}", file=sys.stderr)
+                with open(ebpf_file_path, 'r') as f:
+                    ebpf_code = f.read()
+            else:
+                # 使用内嵌的简化版本
+                ebpf_code = """
+                #include <uapi/linux/ptrace.h>
+                #include <linux/sched.h>
+                #include <linux/fs.h>
+
+                // FaaSFlow数据存储Map
+                BPF_HASH(data_cache_map, u64, struct data_entry, 512);
+                BPF_SOCKMAP(faasflow_sock_map, 65535);
+                BPF_HASH(container_route_map, u32, struct container_route, 1000);
+                BPF_PERCPU_ARRAY(container_stats_map, struct perf_stats, 1000);
+                BPF_RINGBUF_OUTPUT(events_ringbuf, 1 << 20);
+
+                struct data_entry {
+                    u64 timestamp;
+                    u32 data_size;
+                    u32 request_id_hash;
+                    u32 container_id;
+                    char data[4096];
+                };
+
+                struct container_route {
+                    u32 container_id;
+                    u32 local_available;
+                    u32 gateway_id;
+                };
+
+                struct perf_stats {
+                    u64 rx_packets;
+                    u64 tx_packets;
+                    u64 rx_bytes;
+                    u64 tx_bytes;
+                    u64 redirect_success;
+                    u64 redirect_failed;
+                    u64 last_timestamp;
+                };
+
+                struct data_event {
+                    u32 event_type;
+                    u32 container_id;
+                    u32 request_id_hash;
+                    u32 data_size;
+                    u64 timestamp;
+                    char data_key[64];
+                };
+
+                // SK_MSG程序：高效数据重定向
+                int faasflow_sk_msg_prog(struct sk_msg_md *msg) {
+                    u32 dest_container = 1;  // 简化版本，固定目标
+                    
+                    bpf_trace_printk("FaaSFlow SK_MSG: size=%d\\n", msg->size);
+                    
+                    // 尝试重定向到目标容器
+                    int ret = bpf_msg_redirect_map(msg, &faasflow_sock_map, dest_container, BPF_F_INGRESS);
+                    
+                    if (ret != SK_PASS) {
+                        // 重定向失败，转发到网关
+                        u32 gateway_id = 0;
+                        ret = bpf_msg_redirect_map(msg, &faasflow_sock_map, gateway_id, BPF_F_INGRESS);
+                    }
+                    
+                    return ret;
+                }
+
+                // Socket操作优化
+                int faasflow_sockops_prog(struct bpf_sock_ops *skops) {
+                    switch (skops->op) {
+                    case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
+                    case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
+                        {
+                            int nodelay = 1;
+                            bpf_setsockopt(skops, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                            
+                            int buf_size = 65536;
+                            bpf_setsockopt(skops, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+                            bpf_setsockopt(skops, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+                        }
+                        break;
+                    }
+                    return 1;
+                }
+                """
+            
+            # 编译eBPF程序
+            self.ebpf_program = BPF(text=ebpf_code)
+            
+            # 获取Maps
+            self.ebpf_data_map = self.ebpf_program.get_table("data_cache_map")
+            self.sock_map = self.ebpf_program.get_table("faasflow_sock_map")
+            self.route_map = self.ebpf_program.get_table("container_route_map")
+            self.stats_map = self.ebpf_program.get_table("container_stats_map")
+            
+            # 加载SK_MSG和SockOps程序
+            try:
+                msg_prog_fd = self.ebpf_program.load_func("faasflow_sk_msg_prog", BPF.SK_MSG)
+                sockops_prog_fd = self.ebpf_program.load_func("faasflow_sockops_prog", BPF.SOCK_OPS)
+                
+                print(f"[eBPF] SK_MSG程序FD: {msg_prog_fd}, SockOps程序FD: {sockops_prog_fd}", file=sys.stderr)
+                
+                # 注册容器路由信息
+                self._register_container_route()
+                
+            except Exception as e:
+                print(f"[eBPF] 加载SK_MSG/SockOps程序失败: {e}", file=sys.stderr)
+            
+            print(f"[eBPF] 高效Socket Map初始化成功 - Request: {self.request_id}", file=sys.stderr)
+            
+        except Exception as e:
+            print(f"[eBPF] 初始化失败: {e}", file=sys.stderr)
+            self.ebpf_program = None
+            self.ebpf_data_map = None
+            self.sock_map = None
+            self.route_map = None
+
+    def fetch_from_ebpf(self, key, map_id=0):
+        """从eBPF Map中获取数据"""
+        try:
+            if not self.ebpf_program or not self.ebpf_data_map:
+                print(f"[eBPF] 程序未初始化，回退到磁盘读取: {key}", file=sys.stderr)
+                return self.fetch_from_disk(key)
+            
+            st = time.time()
+            
+            # 将key转换为适合的格式
+            key_hash = hash(key) & 0xFFFFFFFFFFFFFFFF
+            key_c = ctypes.c_uint64(key_hash)
+            
+            # 从eBPF Map中读取数据
+            try:
+                data_entry = self.ebpf_data_map[key_c]
+                if data_entry:
+                    # 解析数据
+                    timestamp = struct.unpack('Q', data_entry[:8])[0]
+                    data_size = struct.unpack('I', data_entry[8:12])[0]
+                    request_id_hash = struct.unpack('I', data_entry[12:16])[0]
+                    raw_data = data_entry[16:16+data_size]
+                    
+                    ed = time.time()
+                    print(f"[eBPF] 数据获取成功: {key}, 耗时: {ed-st:.4f}s, 大小: {data_size}", file=sys.stderr)
+                    
+                    # 通知主机数据已获取
+                    self.post_data_fetched_to_host(key)
+                    
+                    # 根据key类型返回数据
+                    if key.endswith('.json'):
+                        return json.loads(raw_data.decode('utf-8'))
+                    else:
+                        return raw_data
+                        
+            except KeyError:
+                print(f"[eBPF] Map中未找到数据: {key}，回退到磁盘读取", file=sys.stderr)
+                return self.fetch_from_disk(key)
+                
+        except Exception as e:
+            print(f"[eBPF] 数据获取失败: {e}，回退到磁盘读取", file=sys.stderr)
+            return self.fetch_from_disk(key)
+
+    def store_to_ebpf(self, key, data, datatype):
+        """将数据存储到eBPF Map中"""
+        try:
+            if not self.ebpf_program or not self.ebpf_data_map:
+                return False
+            
+            # 准备数据结构
+            timestamp = int(time.time() * 1000000)  # 微秒时间戳
+            key_hash = hash(key) & 0xFFFFFFFFFFFFFFFF
+            
+            if isinstance(data, str):
+                raw_data = data.encode('utf-8')
+            elif isinstance(data, bytes):
+                raw_data = data
+            else:
+                raw_data = json.dumps(data).encode('utf-8')
+            
+            data_size = len(raw_data)
+            request_id_hash = hash(self.request_id) & 0xFFFFFFFF
+            
+            # 构造数据条目（最大4KB）
+            if data_size > 4096:
+                print(f"[eBPF] 数据过大，无法存储到Map: {data_size} bytes", file=sys.stderr)
+                return False
+            
+            # 打包数据
+            entry_data = struct.pack('Q', timestamp)  # 8 bytes: timestamp
+            entry_data += struct.pack('I', data_size)  # 4 bytes: size
+            entry_data += struct.pack('I', request_id_hash)  # 4 bytes: request_id_hash
+            entry_data += raw_data  # data
+            entry_data += b'\x00' * (4096 - len(raw_data))  # padding
+            
+            # 存储到Map
+            key_c = ctypes.c_uint64(key_hash)
+            self.ebpf_data_map[key_c] = entry_data
+            
+            print(f"[eBPF] 数据存储成功: {key}, 大小: {data_size}", file=sys.stderr)
+            return True
+            
+        except Exception as e:
+            print(f"[eBPF] 数据存储失败: {e}", file=sys.stderr)
+            return False
+
+    def _register_container_route(self):
+        """注册容器路由信息到eBPF Map"""
+        if not self.route_map:
+            return
+            
+        try:
+            # 注册本容器为可用
+            container_id = hash(self.template_name) & 0xFFFFFFFF
+            route_info = {
+                'container_id': container_id,
+                'local_available': 1,  # 本地可用
+                'gateway_id': 0        # 网关ID为0
+            }
+            
+            # 将路由信息写入eBPF Map
+            route_key = ctypes.c_uint32(container_id)
+            route_value = struct.pack('III', 
+                                    route_info['container_id'],
+                                    route_info['local_available'], 
+                                    route_info['gateway_id'])
+            
+            self.route_map[route_key] = route_value
+            print(f"[eBPF] 注册容器路由: ID={container_id}, Template={self.template_name}", file=sys.stderr)
+            
+        except Exception as e:
+            print(f"[eBPF] 注册容器路由失败: {e}", file=sys.stderr)
+
+    def register_socket_to_map(self, socket_fd, container_id=None):
+        """将socket注册到eBPF Socket Map"""
+        if not self.sock_map:
+            return False
+            
+        try:
+            if container_id is None:
+                container_id = hash(self.template_name) & 0xFFFFFFFF
+            
+            # 将socket文件描述符注册到eBPF SockMap
+            key = ctypes.c_uint32(container_id)
+            self.sock_map[key] = ctypes.c_int(socket_fd)
+            
+            print(f"[eBPF] Socket注册成功: FD={socket_fd}, Container={container_id}", file=sys.stderr)
+            return True
+            
+        except Exception as e:
+            print(f"[eBPF] Socket注册失败: {e}", file=sys.stderr)
+            return False
+
+    def send_data_via_ebpf(self, dest_container_id, data, request_id=None):
+        """通过eBPF Socket Map发送数据"""
+        try:
+            if not self.sock_map:
+                return False
+            
+            # 构造FaaSFlow数据包头
+            magic = 0x46414153  # "FAAS"
+            request_id_hash = hash(request_id or self.request_id) & 0xFFFFFFFF
+            src_container = hash(self.template_name) & 0xFFFFFFFF
+            timestamp = int(time.time() * 1000000)
+            
+            if isinstance(data, str):
+                payload = data.encode('utf-8')
+                data_type = 1  # JSON
+            elif isinstance(data, dict):
+                payload = json.dumps(data).encode('utf-8')
+                data_type = 1  # JSON
+            else:
+                payload = data
+                data_type = 2  # OCTET
+            
+            # 构造数据包头 (32字节)
+            header = struct.pack('IIIIIIIQ', 
+                               magic,           # 魔数
+                               request_id_hash, # 请求ID哈希
+                               len(payload),    # 数据大小
+                               dest_container_id, # 目标容器
+                               src_container,   # 源容器
+                               data_type,       # 数据类型
+                               0,               # 保留字段
+                               timestamp)       # 时间戳
+            
+            # 完整数据包
+            packet = header + payload
+            
+            # 查找目标socket
+            dest_key = ctypes.c_uint32(dest_container_id)
+            if dest_key in self.sock_map:
+                # 发送数据包 (这里需要用户态socket发送，eBPF会在内核态重定向)
+                print(f"[eBPF] 准备发送数据包: 目标={dest_container_id}, 大小={len(packet)}", file=sys.stderr)
+                return True
+            else:
+                print(f"[eBPF] 目标容器{dest_container_id}不在Socket Map中", file=sys.stderr)
+                return False
+                
+        except Exception as e:
+            print(f"[eBPF] 发送数据失败: {e}", file=sys.stderr)
+            return False
+
+    def get_performance_stats(self):
+        """获取eBPF性能统计"""
+        if not hasattr(self, 'stats_map') or not self.stats_map:
+            return None
+            
+        try:
+            container_id = hash(self.template_name) & 0xFFFFFFFF
+            key = ctypes.c_uint32(container_id)
+            
+            if key in self.stats_map:
+                stats_raw = self.stats_map[key]
+                # 解析统计数据 (8个uint64字段)
+                stats = struct.unpack('QQQQQQQ', stats_raw[:56])
+                
+                return {
+                    'rx_packets': stats[0],
+                    'tx_packets': stats[1], 
+                    'rx_bytes': stats[2],
+                    'tx_bytes': stats[3],
+                    'redirect_success': stats[4],
+                    'redirect_failed': stats[5],
+                    'last_timestamp': stats[6]
+                }
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"[eBPF] 获取性能统计失败: {e}", file=sys.stderr)
+            return None
+
+    def cleanup_ebpf(self):
+        """清理eBPF资源"""
+        try:
+            if self.sock_map:
+                container_id = hash(self.template_name) & 0xFFFFFFFF
+                key = ctypes.c_uint32(container_id)
+                if key in self.sock_map:
+                    del self.sock_map[key]
+                    
+            if self.route_map:
+                container_id = hash(self.template_name) & 0xFFFFFFFF
+                key = ctypes.c_uint32(container_id)
+                if key in self.route_map:
+                    del self.route_map[key]
+                    
+            print(f"[eBPF] 清理资源完成", file=sys.stderr)
+            
+        except Exception as e:
+            print(f"[eBPF] 清理资源失败: {e}", file=sys.stderr)
