@@ -135,6 +135,16 @@ if __name__ == '__main__':
     gevent.spawn_later(gc_interval, regular_clear_gc)
     file_controller.init(config.FILE_CONTROLLER_PATH)
     prefetcher.init(config.PREFETCH_POOL_PATH)
+    
+    # 初始化eBPF宿主机管理器
+    try:
+        from ebpf_host_manager import init_ebpf_manager
+        worker_ip = sys.argv[1]
+        ebpf_manager = init_ebpf_manager(worker_ip)
+        print(f"[Proxy] eBPF宿主机管理器已初始化: {worker_ip}")
+    except Exception as e:
+        print(f"[Proxy] eBPF宿主机管理器初始化失败: {e}", file=sys.stderr)
+    
     gevent.spawn(socket_server)
     server = WSGIServer(('0.0.0.0', int(sys.argv[2])), app, log=None)
     server.serve_forever()
