@@ -13,7 +13,7 @@ import ctypes
 import mmap
 import struct
 try:
-    from bcc import BPF
+    from bcc import BPF  # type: ignore[import]
     EBPF_AVAILABLE = True
 except ImportError:
     EBPF_AVAILABLE = False

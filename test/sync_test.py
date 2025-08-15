@@ -189,23 +189,9 @@ def test_to_one(workflow_name, loop_cnt, duration):
 
 def test_to_all():
     print(input_args)
-    target_workflow = {'recognizer': {1: 10, 2: 10, 4: 10, 8: 10, 9: 10, 10: 10, 11: 10, 12: 10},
-                       'video': {1: 10, 2: 10, 4: 10, 8: 10, 16: 10, 24: 10, 30: 10, 32: 10},
-                       'wordcount': {1: 5, 2: 5, 4: 5, 8: 5, 16: 5, 19: 5, 20: 5, 21: 5, 22: 5, 23: 5, 24: 5}}
-    # target_workflow = {
-    #     'recognizer': {11: 10, 12: 10, 13: 10},
-    #     'video': {12: 10, 13: 10, 14: 10},
-    #     'wordcount': {23: 5},
-    #     }
-    # target_workflow = {
-    #     'video': {28: 10, 30: 10}}
-    target_workflow = {'recognizer': {1: 1},
-                       'video': {1: 1},
-                       'svd': {1: 1},
-                       'wordcount': {1: 1}}
-    # target_workflow = {
-    #                    'recognizer': {6: 10},
-    #                    'video': {2: 10, 4: 10, 8: 10, 16: 10, 24: 10, 32: 10, 36: 10}}
+    # 只运行svd工作流一次
+    target_workflow = {'svd': {1: 1}}
+    
     for workflow_name in target_workflow:
         for loop_cnt in target_workflow[workflow_name]:
             test_to_one(workflow_name, loop_cnt, 60 * target_workflow[workflow_name][loop_cnt])

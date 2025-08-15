@@ -1,0 +1,30 @@
+[tool.pyright]
+# Pyright/Pylance配置
+pythonVersion = "3.7"
+include = ["src", "scripts"]
+exclude = ["**/__pycache__"]
+stubPath = "stubs"
+
+# 类型检查严格性
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
+reportMissingTypeStubs = "warning"
+reportUnknownMemberType = "information"
+
+# eBPF相关配置
+reportMissingModuleSource = "information"
+
+[tool.basedpyright]
+# BasedPyright特定配置
+include = ["src", "scripts"]
+exclude = ["**/__pycache__"]
+stubPath = "stubs"
+typeCheckingMode = "basic"
+
+# 对于第三方库的宽松配置
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+
+# 忽略特定模块的导入警告
+ignore = ["bcc"]

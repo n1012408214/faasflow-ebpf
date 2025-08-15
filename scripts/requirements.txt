@@ -9,3 +9,4 @@ PyYAML
 pykafka
 kafka-python
 confluent-kafka
+bcc

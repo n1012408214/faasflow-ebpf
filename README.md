@@ -108,6 +108,36 @@ Directly run on the gateway node:
     python3 async_colocation_test.py
 ```
 
+## Quick Deployment
+
+For quick deployment with the configured IP addresses (Gateway: 192.168.2.156, Storage: 192.168.2.157, Workers: 192.168.2.154, 192.168.2.155), you can use the following scripts:
+
+### Automated Deployment
+```bash
+# Run on each node
+./scripts/deploy_all.sh
+```
+
+### Quick Start Services
+```bash
+# Run on each node to start services
+./scripts/quick_start.sh
+```
+
+### Network Testing
+```bash
+# Test network connectivity between nodes
+./scripts/network_test.sh
+```
+
+### Deployment Verification
+```bash
+# Verify deployment status
+./scripts/verify_deployment.sh
+```
+
+For detailed deployment instructions, see `DEPLOYMENT_GUIDE.md`.
+
 ## Cite
 Welcome to cite FaaSFlow in ASPLOS'22 by:
 ```
